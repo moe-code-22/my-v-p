@@ -2,68 +2,68 @@
 
 import { kv } from '@vercel/kv';
 
-// --- CONFIGURATION ---
-const MESSAGE_LIMIT = 15; // Max messages per user
-const TIME_WINDOW_SECONDS = 60 * 60; // 1 hour window
-
-// --- CORS Headers ---
-// These headers allow your frontend to communicate with this endpoint
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*', // Allows any origin. For production, you could restrict this to your github.io domain.
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+// This is the magic line that enables Edge Functions and eliminates cold starts.
+export const config = {
+  runtime: 'edge',
 };
 
-export default async function handler(request, response) {
-  // The browser will send an 'OPTIONS' request first to check if it's safe to send the actual POST request.
-  // We must respond to this with the correct CORS headers.
+// --- CONFIGURATION ---
+const MESSAGE_LIMIT = 15; // Max messages per user
+const TIME_WINDOW_SECONDS = 3600; // 1 hour in seconds
+
+export default async function handler(request) {
+  // STEP 1: Handle the CORS preflight request for browsers.
+  // This must be handled before any other logic.
   if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: corsHeaders });
-  }
-
-  // We only want to handle POST requests for the actual chat logic
-  if (request.method !== 'POST') {
-    return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
-      status: 405,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      },
     });
   }
 
-  // Get the user's IP address.
-  const ip = request.headers['x-forwarded-for'] || request.socket.remoteAddress;
-  if (!ip) {
-    return new Response(JSON.stringify({ error: 'Could not identify user IP address.' }), {
-      status: 400,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
-  }
-
-  const key = `rate_limit_${ip}`;
-
+  // A universal try...catch block to ensure any error returns a proper JSON response with CORS headers.
   try {
-    // --- RATE LIMITING LOGIC ---
+    // STEP 2: Ensure the request method is POST.
+    if (request.method !== 'POST') {
+      throw new Error('Method not allowed. Please use POST.');
+    }
+
+    // STEP 3: Rate Limiting Logic
+    const ip = request.headers.get('x-forwarded-for');
+    if (!ip) {
+      throw new Error('Could not identify user.');
+    }
+
+    const key = `rate_limit_${ip}`;
     let record = await kv.get(key);
+
     if (!record || (Date.now() - record.firstRequestTime) / 1000 > TIME_WINDOW_SECONDS) {
       record = { count: 0, firstRequestTime: Date.now() };
     }
 
     if (record.count >= MESSAGE_LIMIT) {
-      const errorMessage = "To make things work for everyone, limits are applied. I am sorry but this community tool is for everyone to benefit from it for a quick AI question and not your daily model.";
-      return new Response(JSON.stringify({ error: errorMessage }), {
-        status: 429,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+      // Use a custom Error subclass for specific status codes
+      throw new Error('Rate limit exceeded. The custom message will be handled on the client.');
     }
     
-    // --- AI CALL LOGIC ---
-    const { message } = await request.json(); // Moved this line here
-    if (!message) {
-      return new Response(JSON.stringify({ error: 'Message is required' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+    // STEP 4: Get the user's message from the request body.
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      throw new Error('Invalid request body. Please send a valid JSON.');
     }
 
+    const { message } = body;
+    if (!message || typeof message !== 'string') {
+      throw new Error('A "message" property is required in the request body.');
+    }
+
+    // STEP 5: Call the Groq AI API.
     const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -77,27 +77,46 @@ export default async function handler(request, response) {
     });
 
     if (!groqResponse.ok) {
-        throw new Error("The AI service returned an error.");
+        const errorDetails = await groqResponse.text();
+        console.error("Groq API Error:", errorDetails);
+        throw new Error('The AI service failed to respond.');
     }
     
-    // Increment the user's message count in the database AFTER a successful AI call
+    // STEP 6: Update the rate limit count in the database AFTER a successful AI call.
     await kv.set(key, { ...record, count: record.count + 1 }, { ex: TIME_WINDOW_SECONDS });
 
     const data = await groqResponse.json();
     const botMessage = data.choices[0]?.message?.content || "Sorry, I couldn't get a response.";
 
-    // Send the successful response
+    // STEP 7: Send the successful response back to the client.
     return new Response(JSON.stringify({ reply: botMessage }), {
-        status: 200,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
     });
 
   } catch (error) {
-    console.error('API Error:', error);
-    // Send an error response
-    return new Response(JSON.stringify({ error: error.message || 'Failed to communicate with the AI service.' }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    // This is our universal error handler. It catches any error thrown above.
+    console.error('An error occurred:', error);
+    
+    let errorMessage = error.message;
+    let statusCode = 500; // Internal Server Error by default
+
+    if (errorMessage.includes('Rate limit exceeded')) {
+        errorMessage = "To make things work for everyone, limits are applied. I am sorry but this community tool is for everyone to benefit from it for a quick AI question and not your daily model.";
+        statusCode = 429; // Too Many Requests
+    } else if (errorMessage.includes('Method not allowed')) {
+        statusCode = 405;
+    }
+
+    return new Response(JSON.stringify({ error: errorMessage }), {
+      status: statusCode,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*', // CRITICAL: Also add CORS header to error responses
+      },
     });
   }
 }
